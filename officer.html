@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>BSIT 1A — Officer Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@600;700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jsQR/1.4.0/jsQR.js"></script>
+<link rel="stylesheet" href="officer-style.css">
+</head>
+<body>
+<div id="app"></div>
+
+<script type="module">
+  // ---- Firebase config: paste the SAME config used in the student QR site ----
+  const firebaseConfig = {
+    apiKey: "YOUR_API_KEY",
+    authDomain: "YOUR_PROJECT.firebaseapp.com",
+    projectId: "YOUR_PROJECT_ID",
+    storageBucket: "YOUR_PROJECT.appspot.com",
+    messagingSenderId: "YOUR_SENDER_ID",
+    appId: "YOUR_APP_ID"
+  };
+
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.13.2/firebase-app.js";
+  import {
+    getAuth, signInWithEmailAndPassword, onAuthStateChanged, signOut
+  } from "https://www.gstatic.com/firebasejs/10.13.2/firebase-auth.js";
+  import {
+    getFirestore, collection, doc, getDoc, getDocs, setDoc, addDoc,
+    serverTimestamp, query, orderBy, getCountFromServer
+  } from "https://www.gstatic.com/firebasejs/10.13.2/firebase-firestore.js";
+
+  const app = initializeApp(firebaseConfig);
+  const auth = getAuth(app);
+  const db = getFirestore(app);
+
+  const el = document.getElementById('app');
+  function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+  function fmtTime(d){ return d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}); }
+  function fmtDate(d){ return d.toLocaleDateString([], {month:'short', day:'numeric', year:'numeric'}); }
+
+  const state = { user:null, events:[], studentCount:0, currentEvent:null, attendance:[], scanStream:null, scanRAF:null, scanLock:false, scanFlash:null };
+
+  function topbar(showBack, showLogout){
+    return `<header class="topbar">
+      <div class="brand"><span class="tag display">BSIT 1A</span><span class="sub mono">OFFICERS</span></div>
+      <div style="display:flex;gap:14px;">
+        ${showBack ? '<button class="link-btn" id="btn-home">&larr; Dashboard</button>' : ''}
+        ${showLogout ? '<button class="link-btn" id="btn-logout">Sign out</button>' : ''}
+      </div>
+    </header>`;
+  }
+
+  // ---------- login ----------
+  function renderLogin(err){
+    el.innerHTML = topbar(false,false) + `<div class="wrap">
+      <h1 class="hero display">Officer login</h1>
+      <p class="lede">Sign in with the account your mayor created for you.</p>
+      <div class="panel">
+        <div class="field"><label>Email</label><input id="in-email" type="email" placeholder="you@example.com" /></div>
+        <div class="field"><label>Password</label><input id="in-pass" type="password" /></div>
+        ${err ? `<div class="error-text">${esc(err)}</div>` : ''}
+        <button class="btn" id="btn-login">Sign in</button>
+      </div>
+    </div>`;
+    document.getElementById('btn-login').onclick = async () => {
+      const email = document.getElementById('in-email').value.trim();
+      const pass = document.getElementById('in-pass').value;
+      if(!email || !pass){ renderLogin('Enter your email and password.'); return; }
+      try{
+        await signInWithEmailAndPassword(auth, email, pass);
+      }catch(e){
+        renderLogin('Sign in failed. Check your email and password.');
+      }
+    };
+  }
+
+  // ---------- dashboard ----------
+  async function loadDashboard(){
+    const evSnap = await getDocs(query(collection(db,'events'), orderBy('createdAt','desc')));
+    const events = [];
+    for(const d of evSnap.docs){
+      const ev = { id: d.id, ...d.data() };
+      try{
+        const cnt = await getCountFromServer(collection(db,'events',ev.id,'records'));
+        ev.presentCount = cnt.data().count;
+      }catch(e){ ev.presentCount = '—'; }
+      events.push(ev);
+    }
+    state.events = events;
+    try{
+      const stuCnt = await getCountFromServer(collection(db,'students'));
+      state.studentCount = stuCnt.data().count;
+    }catch(e){ state.studentCount = '—'; }
+  }
+
+  function renderDashboard(){
+    const list = state.events.length ? state.events.map(ev => `
+      <div class="event-row" data-id="${esc(ev.id)}">
+        <div><div class="name">${esc(ev.name)}</div><div class="date mono">${ev.date ? esc(ev.date) : ''}</div></div>
+        <div class="count mono">${ev.presentCount} present</div>
+      </div>`).join('') : '<div class="empty">No events yet. Create one to start scanning attendance.</div>';
+
+    el.innerHTML = topbar(false, true) + `<div class="wrap">
+      <h1 class="hero display">Dashboard</h1>
+      <p class="lede">Signed in as ${esc(state.user.email)}</p>
+      <div class="stat-row">
+        <div class="stat"><div class="n display">${state.events.length}</div><div class="l mono">EVENTS</div></div>
+        <div class="stat"><div class="n display">${state.studentCount}</div><div class="l mono">REGISTERED</div></div>
+      </div>
+      <div class="btn-row">
+        <button class="btn" id="btn-new-event">+ New event</button>
+        <button class="btn secondary" id="btn-roster">Roster</button>
+      </div>
+      <div class="section-hd"><h2>Events</h2></div>
+      ${list}
+    </div>`;
+
+    document.getElementById('btn-logout').onclick = () => signOut(auth);
+    document.getElementById('btn-new-event').onclick = () => renderNewEvent();
+    document.getElementById('btn-roster').onclick = () => renderRoster();
+    el.querySelectorAll('.event-row').forEach(row => {
+      row.onclick = () => openEvent(row.dataset.id);
+    });
+  }
+
+  // ---------- new event ----------
+  function renderNewEvent(err){
+    const today = new Date().toISOString().slice(0,10);
+    el.innerHTML = topbar(true, true) + `<div class="wrap">
+      <h1 class="hero display" style="font-size:28px;">New event</h1>
+      <div class="panel">
+        <div class="field"><label>Event name</label><input id="in-ev-name" type="text" placeholder="Flag ceremony, Quiz Bee..." /></div>
+        <div class="field"><label>Date</label><input id="in-ev-date" type="date" value="${today}" /></div>
+        ${err ? `<div class="error-text">${esc(err)}</div>` : ''}
+        <button class="btn" id="btn-create-event">Create &amp; open scanner</button>
+      </div>
+    </div>`;
+    document.getElementById('btn-home').onclick = () => { loadDashboard().then(renderDashboard); };
+    document.getElementById('btn-logout').onclick = () => signOut(auth);
+    document.getElementById('btn-create-event').onclick = async () => {
+      const name = document.getElementById('in-ev-name').value.trim();
+      const date = document.getElementById('in-ev-date').value;
+      if(!name){ renderNewEvent('Give the event a name.'); return; }
+      const ref = await addDoc(collection(db,'events'), { name, date, createdAt: serverTimestamp(), createdBy: state.user.uid });
+      state.currentEvent = { id: ref.id, name, date };
+      state.attendance = [];
+      renderScan();
+    };
+  }
+
+  // ---------- roster ----------
+  async function renderRoster(){
+    el.innerHTML = topbar(true, true) + `<div class="wrap"><p class="lede">Loading roster...</p></div>`;
+    document.getElementById('btn-home').onclick = () => { loadDashboard().then(renderDashboard); };
+    document.getElementById('btn-logout').onclick = () => signOut(auth);
+    const snap = await getDocs(query(collection(db,'students'), orderBy('name')));
+    const rows = snap.docs.map((d,i) => {
+      const s = d.data();
+      return `<div class="ledger-row"><div class="idx mono">${i+1}</div><div class="nm">${esc(s.name)}${s.number ? ` <span class="mono" style="color:var(--text-muted);font-size:12px;">${esc(s.number)}</span>` : ''}</div></div>`;
+    }).join('');
+    el.querySelector('.wrap').innerHTML = `
+      <h1 class="hero display" style="font-size:28px;">Roster</h1>
+      <p class="lede">${snap.size} student(s) registered.</p>
+      ${snap.size ? `<div class="ledger">${rows}</div>` : '<div class="empty">No students registered yet.</div>'}
+    `;
+  }
+
+  // ---------- event view ----------
+  async function openEvent(eventId){
+    const evDoc = await getDoc(doc(db,'events',eventId));
+    if(!evDoc.exists()){ alert('Event not found'); return; }
+    state.currentEvent = { id: eventId, ...evDoc.data() };
+    await loadAttendance();
+    renderEvent();
+  }
+
+  async function loadAttendance(){
+    const snap = await getDocs(query(collection(db,'events',state.currentEvent.id,'records'), orderBy('timestamp')));
+    state.attendance = snap.docs.map(d => ({ studentId: d.id, ...d.data() }));
+  }
+
+  function renderEvent(){
+    const ev = state.currentEvent;
+    const rows = state.attendance.length ? `<div class="ledger">${state.attendance.map((a,i) => `
+      <div class="ledger-row"><div class="idx mono">${i+1}</div><div class="nm">${esc(a.name)}</div><div class="ts mono">${a.timestamp && a.timestamp.toDate ? esc(fmtTime(a.timestamp.toDate())) : ''}</div></div>
+    `).join('')}</div>` : '<div class="empty">No one checked in yet. Open the scanner to begin.</div>';
+
+    el.innerHTML = topbar(true, true) + `<div class="wrap">
+      <h1 class="hero display" style="font-size:24px;">${esc(ev.name)}</h1>
+      <p class="lede" style="margin-bottom:18px;">${ev.date ? esc(ev.date) : ''} &middot; ${state.attendance.length} present</p>
+      <div class="btn-row" style="margin-bottom:20px;">
+        <button class="btn" id="btn-scan">Open scanner</button>
+        <button class="btn secondary" id="btn-csv">Export CSV</button>
+      </div>
+      <div class="section-hd"><h2>Check-in log</h2></div>
+      ${rows}
+    </div>`;
+    document.getElementById('btn-home').onclick = () => { loadDashboard().then(renderDashboard); };
+    document.getElementById('btn-logout').onclick = () => signOut(auth);
+    document.getElementById('btn-scan').onclick = () => renderScan();
+    document.getElementById('btn-csv').onclick = exportCSV;
+  }
+
+  function exportCSV(){
+    const ev = state.currentEvent;
+    const rows = [['#','Name','Student ID','Timestamp']];
+    state.attendance.forEach((a,i) => {
+      const t = a.timestamp && a.timestamp.toDate ? a.timestamp.toDate().toLocaleString() : '';
+      rows.push([i+1, a.name, a.studentId, t]);
+    });
+    const csv = rows.map(r => r.map(v => `"${String(v).replace(/"/g,'""')}"`).join(',')).join('\n');
+    const blob = new Blob([csv], { type:'text/csv' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = (ev.name.toLowerCase().replace(/[^a-z0-9]+/g,'-') || 'event') + '-attendance.csv';
+    document.body.appendChild(a); a.click(); a.remove();
+  }
+
+  // ---------- scanner ----------
+  async function stopScanner(){
+    if(state.scanRAF) cancelAnimationFrame(state.scanRAF);
+    state.scanRAF = null;
+    if(state.scanStream){ state.scanStream.getTracks().forEach(t=>t.stop()); state.scanStream = null; }
+  }
+
+  function renderScan(){
+    const ev = state.currentEvent;
+    el.innerHTML = topbar(true, true) + `<div class="wrap">
+      <h1 class="hero display" style="font-size:22px;">${esc(ev.name)}</h1>
+      <p class="lede" style="margin-bottom:16px;">Point the camera at a student's QR code.</p>
+      <div class="scan-wrap"><video id="scan-video" playsinline muted></video><div class="scan-frame"></div><div id="scan-flash-host"></div></div>
+      <canvas id="scan-canvas" style="display:none;"></canvas>
+      <div class="stat-row"><div class="stat"><div class="n display" id="scan-count">${state.attendance.length}</div><div class="l mono">CHECKED IN</div></div></div>
+      <button class="btn secondary" id="btn-back-log">Back to event log</button>
+    </div>`;
+    document.getElementById('btn-home').onclick = async () => { await stopScanner(); loadDashboard().then(renderDashboard); };
+    document.getElementById('btn-logout').onclick = async () => { await stopScanner(); signOut(auth); };
+    document.getElementById('btn-back-log').onclick = async () => { await stopScanner(); await loadAttendance(); renderEvent(); };
+    setupScanner();
+  }
+
+  function flash(type, big, small){
+    const host = document.getElementById('scan-flash-host');
+    if(!host) return;
+    host.innerHTML = `<div class="scan-flash ${type}"><div class="big display">${esc(big)}</div><div class="small mono">${esc(small)}</div></div>`;
+    setTimeout(()=>{ if(host) host.innerHTML=''; state.scanLock=false; }, type==='ok' ? 1200 : 1400);
+  }
+
+  async function setupScanner(){
+    const video = document.getElementById('scan-video');
+    const canvas = document.getElementById('scan-canvas');
+    try{
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+      state.scanStream = stream;
+      video.srcObject = stream;
+      await video.play();
+    }catch(e){ alert('Camera access denied or unavailable.'); return; }
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    function tick(){
+      if(!document.getElementById('scan-video')) return; // view changed
+      if(video.readyState === video.HAVE_ENOUGH_DATA){
+        canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+        ctx.drawImage(video,0,0,canvas.width,canvas.height);
+        if(!state.scanLock){
+          const imgData = ctx.getImageData(0,0,canvas.width,canvas.height);
+          const code = jsQR(imgData.data, imgData.width, imgData.height);
+          if(code && code.data) handleScan(code.data.trim());
+        }
+      }
+      state.scanRAF = requestAnimationFrame(tick);
+    }
+    state.scanRAF = requestAnimationFrame(tick);
+  }
+
+  async function handleScan(studentId){
+    state.scanLock = true;
+    try{
+      const stuDoc = await getDoc(doc(db,'students',studentId));
+      if(!stuDoc.exists()){ flash('err','Unknown code','Not a registered student QR'); return; }
+      const student = stuDoc.data();
+      const recRef = doc(db,'events',state.currentEvent.id,'records',studentId);
+      const recDoc = await getDoc(recRef);
+      if(recDoc.exists()){
+        const t = recDoc.data().timestamp && recDoc.data().timestamp.toDate ? fmtTime(recDoc.data().timestamp.toDate()) : '';
+        flash('dup', student.name, 'Already checked in at ' + t);
+        return;
+      }
+      await setDoc(recRef, { name: student.name, timestamp: serverTimestamp() });
+      state.attendance.push({ studentId, name: student.name });
+      const countEl = document.getElementById('scan-count');
+      if(countEl) countEl.textContent = state.attendance.length;
+      flash('ok', student.name, 'Checked in just now');
+    }catch(e){
+      flash('err','Scan failed','Check your connection and try again');
+    }
+  }
+
+  // ---------- auth wiring ----------
+  onAuthStateChanged(auth, async (user) => {
+    if(user){
+      state.user = user;
+      await loadDashboard();
+      renderDashboard();
+    }else{
+      state.user = null;
+      renderLogin();
+    }
+  });
+</script>
+</body>
+</html>
